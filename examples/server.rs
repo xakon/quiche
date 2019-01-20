@@ -29,6 +29,7 @@
 extern crate log;
 
 use std::net;
+use std::os::unix::io::AsRawFd;
 
 use std::collections::hash_map;
 use std::collections::HashMap;
@@ -219,7 +220,11 @@ fn main() {
         }
 
         for (src, conn) in &mut connections {
+            let mut buf_off = 0;
+
             loop {
+                // let out = &mut out[buf_off..buf_off + MAX_DATAGRAM_SIZE];
+
                 let write = match conn.send(&mut out) {
                     Ok(v) => v,
 
@@ -235,8 +240,45 @@ fn main() {
                     },
                 };
 
-                // TODO: coalesce packets.
-                socket.send_to(&out[..write], &src).unwrap();
+                buf_off += write;
+
+            unsafe {
+                let fd = socket.as_raw_fd();
+
+                let (sockaddr, sockaddrlen) = match src {
+                    net::SocketAddr::V4(ref a) => {
+                        (a as *const _ as *const libc::sockaddr,
+                         std::mem::size_of_val(a) as libc::socklen_t)
+                    },
+
+                    net::SocketAddr::V6(ref a) => {
+                        (a as *const _ as *const libc::sockaddr,
+                         std::mem::size_of_val(a) as libc::socklen_t)
+                    },
+                };
+
+                let mut iov = libc::iovec {
+                    iov_base: (&mut out[..write]).as_mut_ptr() as *mut libc::c_void,
+                    iov_len: write,
+                };
+
+                let msg = libc::msghdr {
+                    msg_name: sockaddr as *mut libc::c_void,
+                    msg_namelen: sockaddrlen,
+
+                    msg_iov: (&mut iov) as *mut libc::iovec,
+                    msg_iovlen: 1,
+
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+
+                    msg_flags: 0,
+                };
+
+                if libc::sendmsg(fd, &msg as *const libc::msghdr, 0) < 0 {
+                    panic!("sendmsg() failed");
+                }
+            }
 
                 debug!("{} written {} bytes", conn.trace_id(), write);
             }
