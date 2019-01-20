@@ -51,9 +51,17 @@ Options:
   --name <str>      Name of the server [default: quic.tech]
 ";
 
+#[repr(C)]
+struct GsoCmsgHdr {
+    cmsg_len: libc::c_uint,
+    cmsg_level: libc::c_int,
+    cmsg_type: libc::c_int,
+    gso_size: libc::uint16_t,
+}
+
 fn main() {
     let mut buf = [0; 65535];
-    let mut out = [0; MAX_DATAGRAM_SIZE];
+    let mut out = [0; 65535];
 
     env_logger::init();
 
@@ -70,6 +78,22 @@ fn main() {
     poll.register(&socket, mio::Token(0),
                   mio::Ready::readable(),
                   mio::PollOpt::edge()).unwrap();
+
+    // Setup UDP_SEGMENT socket option.
+    unsafe {
+        let optval: libc::c_int = MAX_DATAGRAM_SIZE as libc::c_int;
+        let rc = libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_UDP,
+            103, // UDP_SEGMENT
+            &optval as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&optval) as libc::socklen_t,
+        );
+
+        if rc < 0 {
+            panic!("setsockopt(UDP_SEGMENT) failed");
+        }
+    }
 
     let mut connections: HashMap<net::SocketAddr, Box<quiche::Connection>> =
         HashMap::new();
@@ -161,25 +185,25 @@ fn main() {
                     // Token is always present in Initial packets.
                     let token = hdr.token.as_ref().unwrap();
 
-                    if token.is_empty() {
-                        warn!("Doing stateless retry");
+                    // if token.is_empty() {
+                    //     warn!("Doing stateless retry");
 
-                        let new_token = mint_token(&hdr, &src);
+                    //     let new_token = mint_token(&hdr, &src);
 
-                        let len = quiche::retry(&hdr.scid, &hdr.dcid, &scid,
-                                                &new_token, &mut out).unwrap();
-                        let out = &out[..len];
+                    //     let len = quiche::retry(&hdr.scid, &hdr.dcid, &scid,
+                    //                             &new_token, &mut out).unwrap();
+                    //     let out = &out[..len];
 
-                        socket.send_to(out, &src).unwrap();
-                        continue;
-                    }
+                    //     socket.send_to(out, &src).unwrap();
+                    //     continue;
+                    // }
 
-                    let odcid = validate_token(&src, token);
+                    let odcid = None;
 
-                    if odcid == None {
-                        error!("Invalid address validation token");
-                        continue;
-                    }
+                    // if odcid == None {
+                    //     error!("Invalid address validation token");
+                    //     continue;
+                    // }
 
                     debug!("New connection: dcid={} scid={} lcid={}",
                            hex_dump(&hdr.dcid),
@@ -222,10 +246,10 @@ fn main() {
         for (src, conn) in &mut connections {
             let mut buf_off = 0;
 
-            loop {
-                // let out = &mut out[buf_off..buf_off + MAX_DATAGRAM_SIZE];
+            while buf_off + MAX_DATAGRAM_SIZE <= out.len() {
+                let out = &mut out[buf_off..buf_off + MAX_DATAGRAM_SIZE];
 
-                let write = match conn.send(&mut out) {
+                let write = match conn.send(out) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
@@ -241,6 +265,9 @@ fn main() {
                 };
 
                 buf_off += write;
+
+                debug!("{} written {} bytes", conn.trace_id(), write);
+            }
 
             unsafe {
                 let fd = socket.as_raw_fd();
@@ -258,8 +285,15 @@ fn main() {
                 };
 
                 let mut iov = libc::iovec {
-                    iov_base: (&mut out[..write]).as_mut_ptr() as *mut libc::c_void,
-                    iov_len: write,
+                    iov_base: (&mut out[..buf_off]).as_mut_ptr() as *mut libc::c_void,
+                    iov_len: buf_off,
+                };
+
+                let mut gsohdr = GsoCmsgHdr {
+                    cmsg_len: libc::CMSG_LEN(std::mem::size_of::<u16>() as u32),
+                    cmsg_level: libc::SOL_UDP,
+                    cmsg_type: 103,
+                    gso_size: MAX_DATAGRAM_SIZE as u16,
                 };
 
                 let msg = libc::msghdr {
@@ -269,18 +303,15 @@ fn main() {
                     msg_iov: (&mut iov) as *mut libc::iovec,
                     msg_iovlen: 1,
 
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
+                    msg_control: &mut gsohdr as *mut GsoCmsgHdr as *mut libc::c_void,
+                    msg_controllen: std::mem::size_of::<GsoCmsgHdr>(),
 
                     msg_flags: 0,
                 };
 
                 if libc::sendmsg(fd, &msg as *const libc::msghdr, 0) < 0 {
-                    panic!("sendmsg() failed");
+                    panic!("sendmsg() failed: {}", *libc::__errno_location());
                 }
-            }
-
-                debug!("{} written {} bytes", conn.trace_id(), write);
             }
         }
 
