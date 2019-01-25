@@ -50,6 +50,37 @@ pub enum PrioritizedElemType {
     PushStream,
     Placeholder,
     CurrentStream,
+    Error
+}
+
+impl PrioritizedElemType {
+    fn is_peid_absent(&self) -> bool {
+        match *self {
+            PrioritizedElemType::CurrentStream => true,
+            PrioritizedElemType::Error => true,
+            _ => false,
+        }
+    }
+
+    fn to_bits(&self) -> u8 {
+        match *self {
+            PrioritizedElemType::RequestStream  => 0x00,
+            PrioritizedElemType::PushStream     => 0x01,
+            PrioritizedElemType::Placeholder    => 0x02,
+            PrioritizedElemType::CurrentStream  => 0x03,
+            _                                   => 0x04,
+        }
+    }
+
+    fn from_bits(bits: u8) -> PrioritizedElemType {
+        match bits {
+            0x00 => PrioritizedElemType::RequestStream,
+            0x01 => PrioritizedElemType::PushStream,
+            0x02 => PrioritizedElemType::Placeholder,
+            0x03 => PrioritizedElemType::CurrentStream,
+            _    => PrioritizedElemType::Error
+        }
+    }
 }
 
 /// H3 Element Dependency type.
@@ -59,6 +90,37 @@ pub enum ElemDependencyType {
     PushStream,
     Placeholder,
     RootOfTree,
+    Error
+}
+
+impl ElemDependencyType {
+    fn is_edid_absent(&self) -> bool {
+        match *self {
+            ElemDependencyType::RootOfTree => true,
+            ElemDependencyType::Error => true,
+            _ => false,
+        }
+    }
+
+    fn to_bits(&self) -> u8 {
+        match *self {
+            ElemDependencyType::RequestStream  => 0x00,
+            ElemDependencyType::PushStream     => 0x01,
+            ElemDependencyType::Placeholder    => 0x02,
+            ElemDependencyType::RootOfTree     => 0x03,
+            _                                  => 0x04,
+        }
+    }
+
+    fn from_bits(bits: u8) -> ElemDependencyType {
+        match bits {
+            0x00 => ElemDependencyType::RequestStream,
+            0x01 => ElemDependencyType::PushStream,
+            0x02 => ElemDependencyType::Placeholder,
+            0x03 => ElemDependencyType::RootOfTree,
+            _    => ElemDependencyType::Error,
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -112,10 +174,9 @@ impl H3Frame {
         let payload_length = b.get_varint()?;
         let frame_type = b.get_u8()?;
 
-        // println!("GOT FRAME {:x}", frame_type);
+        //debug!("GOT FRAME {:x}, payload_len= {:x}", frame_type, payload_length);
 
         // TODO handling of 0-length frames
-
         let frame = match frame_type {
             0x0 => H3Frame::Data {
                 payload: b.get_bytes(payload_length as usize)?.to_vec(),
@@ -156,6 +217,8 @@ impl H3Frame {
     pub fn to_bytes(&self, b: &mut octets::Octets) -> Result<usize> {
         let before = b.cap();
 
+        debug!("Serializing frame type {:?}", self);
+
         match self {
             H3Frame::Data { payload } => {
                 b.put_varint(payload.len() as u64)?;
@@ -169,21 +232,43 @@ impl H3Frame {
                 b.put_varint(0x01)?;
 
                 b.put_bytes(header_block.as_ref())?;
+
+                //dbg!(&b);
             },
 
-            H3Frame::Priority { .. } => {
-                // TODO: parse PT and DT to determine if PEID or EDID will be present
-                // b.put_varint( length)?;
-                // b.put_varint(0x02)?;
+            H3Frame::Priority { priority_elem, elem_dependency,
+                                prioritized_element_id,
+                                element_dependency_id,
+                                weight,
+                                 } => {
+                let peid_present = priority_elem.is_peid_absent();
+                let edid_present = elem_dependency.is_edid_absent();
 
-                // let mut bitfield = 0 as u8;
-                // ...
+                let mut length = 2 * mem::size_of::<u8>(); // 2 u8s = (PT+DT+Empty) + Weight
+                if peid_present {
+                    length += octets::varint_len(*prioritized_element_id);
+                }
 
-                //b.put_varint(u64::from(ty))?;
+                if edid_present {
+                    length += octets::varint_len(*element_dependency_id);
+                }
 
-                //b.put_varint(prioritized_element_id)?;
-                //b.put_varint(element_dependency_id)?;
-                //b.put_u8(weight)?;
+                b.put_varint(length as u64)?;
+                b.put_varint(0x02)?;
+
+                let mut bitfield = priority_elem.to_bits() << 6;
+                bitfield |= elem_dependency.to_bits() << 4;
+
+                b.put_u8(bitfield)?;
+
+                if peid_present {
+                    b.put_varint(*prioritized_element_id)?;
+                }
+                if edid_present {
+                    b.put_varint(*element_dependency_id)?;
+                }
+
+                b.put_u8(*weight)?;
             },
 
             H3Frame::CancelPush { push_id } => {
@@ -302,26 +387,23 @@ fn parse_priority_frame(b: &mut octets::Octets) -> Result<H3Frame> {
     // TODO: parse PT and DT to determine if PEID or EDID will be present
 
     let bitfield = b.get_u8()?;
-    let prioritized_element_id = b.get_varint()?;
-    let element_dependency_id = b.get_varint()?;
+    let mut prioritized_element_id = 0;
+    let mut element_dependency_id = 0;
+
+    let priority_elem = PrioritizedElemType::from_bits(bitfield >> 6);
+
+    let elem_dependency = ElemDependencyType::from_bits((bitfield & ELEM_DEPENDENCY_TYPE_MASK) >> 4);
+
+    if !priority_elem.is_peid_absent() {
+        prioritized_element_id = b.get_varint()?;
+    }
+
+    if !elem_dependency.is_edid_absent() {
+        element_dependency_id = b.get_varint()?;
+    }
+
+
     let weight = b.get_u8()?;
-
-    let priority_elem = match (bitfield >> 6) {
-        0x00 => PrioritizedElemType::RequestStream,
-        0x01 => PrioritizedElemType::PushStream,
-        0x02 => PrioritizedElemType::Placeholder,
-        0x03 => PrioritizedElemType::CurrentStream,
-        _    => return Err(Error::InvalidPacket),
-    };
-
-    let elem_dependency = match (bitfield & ELEM_DEPENDENCY_TYPE_MASK) >> 4 {
-        0x00 => ElemDependencyType::RequestStream,
-        0x01 => ElemDependencyType::PushStream,
-        0x02 => ElemDependencyType::Placeholder,
-        0x03 => ElemDependencyType::RootOfTree,
-        _    => return Err(Error::InvalidPacket),
-    };
-
     Ok(H3Frame::Priority { priority_elem,
                            elem_dependency,
                            prioritized_element_id,

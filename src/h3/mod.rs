@@ -33,7 +33,7 @@ use super::Result;
 
 pub struct H3Config {
     pub quiche_config: super::Config,
-
+    pub root_dir: String,
 }
 
 impl H3Config {
@@ -44,13 +44,20 @@ impl H3Config {
 
         Ok(H3Config {
             quiche_config: super::Config::new(version).unwrap(),
+            root_dir: String::new(),
         })
+    }
+
+    pub fn set_root_dir(&mut self, root_dir: &String) {
+        self.root_dir = String::clone(root_dir);
     }
 }
 
 /// An HTTP/3 connection.
 pub struct H3Connection {
     pub quic_conn: Box<super::Connection>,
+
+    root_dir: String,
 }
 
 impl H3Connection {
@@ -58,21 +65,59 @@ impl H3Connection {
     fn new(scid: &[u8], odcid: Option<&[u8]>, config: &mut H3Config,
            is_server: bool) -> Result<Box<H3Connection>> {
 
+            let root = String::clone(&config.root_dir); // TODO shouldn't need to clone here
+
             Ok(Box::new(H3Connection {
-                quic_conn: super::Connection::new(scid, None, &mut config.quiche_config, false)?,
+                quic_conn: super::Connection::new(scid, odcid, &mut config.quiche_config, is_server)?,
+                root_dir: root,
             }))
     }
 
+    // Send a no-body request
     pub fn send_request(&mut self, request: std::string::String ) {
-        let reqFrame = frame::H3Frame::Headers{header_block:request.as_bytes().to_vec()};
         let mut d: [u8; 128] = [42; 128];
-        let mut b = octets::Octets::with_slice(&mut d);
-        reqFrame.to_bytes(&mut b).unwrap();
 
-        self.quic_conn.stream_send(4, &b.to_vec(), true).unwrap();
+        let req_frame = frame::H3Frame::Headers {
+            header_block: request.as_bytes().to_vec()
+        };
+
+        let mut b = octets::Octets::with_slice(&mut d);
+        req_frame.to_bytes(&mut b).unwrap();
+        let off = b.off();
+
+        // TODO get an available stream number
+        self.quic_conn.stream_send(0, &mut d[..off], true).unwrap();
     }
 
-    pub fn handle_stream(&mut self, stream: u64, root: &str) {
+    // Send a response
+    pub fn send_response(&mut self, stream: u64, status_line: std::string::String, body: std::string::String ) {
+        let mut d: [u8; 128] = [42; 128];
+
+        let headers = frame::H3Frame::Headers {
+            header_block: status_line.as_bytes().to_vec()
+        };
+
+        let mut b = octets::Octets::with_slice(&mut d);
+        headers.to_bytes(&mut b).unwrap();
+
+        if !body.is_empty() {
+            let data = frame::H3Frame::Data {
+                payload: body.as_bytes().to_vec()
+            };
+            data.to_bytes(&mut b).unwrap();
+        }
+
+        let off = b.off();
+
+        info!("{} sending response of size {} on stream {}",
+                            self.quic_conn.trace_id(), off, stream);
+
+        if let Err(e) = self.quic_conn.stream_send(stream, &mut d[..off], true) {
+            error!("{} stream send failed {:?}", self.quic_conn.trace_id(), e);
+        }
+    }
+
+    pub fn handle_stream(&mut self, stream: u64) {
         let mut stream_data = match self.quic_conn.stream_recv(stream, std::usize::MAX) {
             Ok(v) => v,
 
@@ -82,16 +127,56 @@ impl H3Connection {
                             self.quic_conn.trace_id(), e),
         };
 
-        //let mut o = octets::Octets::with_slice(&mut stream_data);
-
         info!("{} stream {} has {} bytes (fin? {})", self.quic_conn.trace_id(),
             stream, stream_data.len(), stream_data.fin());
 
         // TODO stream frame parsing
-        if (stream_data.len() > 1) {
+        if stream_data.len() > 1 {
             let mut o = octets::Octets::with_slice(&mut stream_data);
             let frame = frame::H3Frame::from_bytes(&mut o).unwrap();
             debug!("received {:?}", frame);
+
+            match frame {
+                frame::H3Frame::Headers { header_block} => {
+                    //debug!("received {:?}", frame);
+                    //dbg!(&header_block);
+
+                    // TODO properly parse HEADERS
+                    if &header_block[..4] == b"GET " {
+                        let uri = &header_block[4..header_block.len()];
+                        let uri = String::from_utf8(uri.to_vec()).unwrap();
+                        let uri = String::from(uri.lines().next().unwrap());
+                        let uri = std::path::Path::new(&uri);
+                        let mut path = std::path::PathBuf::from(String::clone(&self.root_dir));
+
+                        for c in uri.components() {
+                            if let std::path::Component::Normal(v) = c {
+                                path.push(v)
+                            }
+                        }
+
+                        info!("{} got GET request for {:?} on stream {}",
+                            self.quic_conn.trace_id(), path, stream);
+
+                        // TODO *actually* response with something other than 404
+                        self.send_response(stream, String::from("404 Not Found"), String::from(""));
+
+                    } else if &header_block[..4] == b"404 " {
+                        info!("{} got 404 response on stream {}",
+                            self.quic_conn.trace_id(), stream);
+
+                        if stream_data.fin() {
+                            info!("{} response received, closing..,", self.quic_conn.trace_id());
+                            self.quic_conn.close(true, 0x00, b"kthxbye").unwrap();
+                        }
+                    }
+                },
+
+                _ => {
+                    debug!("Not implemented!");
+                },
+            };
+
         }
 
     }

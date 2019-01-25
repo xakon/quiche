@@ -1,4 +1,4 @@
-// Copyright (C) 2018, Cloudflare, Inc.
+// Copyright (C) 2019, Cloudflare, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -29,7 +29,6 @@ extern crate log;
 
 use std::net;
 
-use std::collections::hash_map;
 use std::collections::HashMap;
 
 use ring::rand::*;
@@ -38,16 +37,20 @@ const LOCAL_CONN_ID_LEN: usize = 16;
 
 const MAX_DATAGRAM_SIZE: usize = 1452;
 
-const USAGE: &str = "Usage: h3server [options]
+const USAGE: &str = "Usage:
+  h3server [options]
+  h3server -h | --help
 
 Options:
-  -h --help         Show this screen.
   --listen <addr>   Listen on the given IP:port [default: 127.0.0.1:4433]
   --cert <file>     TLS certificate path [default: examples/cert.crt]
   --key <file>      TLS certificate key path [default: examples/cert.key]
   --root <dir>      Root directory [default: examples/root/]
   --name <str>      Name of the server [default: quic.tech]
+  -h --help         Show this screen.
 ";
+
+type H3ConnMap = HashMap<Vec<u8>, (net::SocketAddr, Box<quiche::h3::H3Connection>)>;
 
 fn main() {
     let mut buf = [0; 65535];
@@ -69,16 +72,14 @@ fn main() {
                   mio::Ready::readable(),
                   mio::PollOpt::edge()).unwrap();
 
-    let mut connections: HashMap<net::SocketAddr, Box<quiche::Connection>> =
-        HashMap::new();
-
-    let mut h3connections: HashMap<net::SocketAddr, Box<quiche::h3::H3Connection>> =
-        HashMap::new();
+    let mut h3connections = H3ConnMap::new();
 
     let mut config = quiche::h3::H3Config::new(quiche::VERSION_DRAFT17).unwrap();
 
     config.quiche_config.load_cert_chain_from_pem_file(args.get_str("--cert")).unwrap();
     config.quiche_config.load_priv_key_from_pem_file(args.get_str("--key")).unwrap();
+
+    config.quiche_config.set_application_protos(&[b"h3-17", b"hq-17", b"http/0.9"]).unwrap();
 
     config.quiche_config.set_idle_timeout(30);
     config.quiche_config.set_max_packet_size(MAX_DATAGRAM_SIZE as u64);
@@ -89,10 +90,12 @@ fn main() {
     config.quiche_config.set_initial_max_streams_uni(5);
     config.quiche_config.set_disable_migration(true);
 
+    config.set_root_dir(&String::from(args.get_str("--root")));
+
     loop {
         // TODO: use event loop that properly supports timers
         let timeout = h3connections.values()
-                                 .filter_map(|h3| h3.quic_conn.timeout())
+                                 .filter_map(|(_, c)| c.quic_conn.timeout())
                                  .min();
 
         poll.poll(&mut events, timeout).unwrap();
@@ -101,7 +104,7 @@ fn main() {
             if events.is_empty() {
                 debug!("timed out");
 
-                h3connections.values_mut().for_each(|h3| h3.quic_conn.on_timeout());
+                h3connections.values_mut().for_each(|(_, c)| c.quic_conn.on_timeout());
 
                 break 'read;
             }
@@ -137,62 +140,62 @@ fn main() {
                 continue;
             }
 
-            let conn = match h3connections.entry(src) {
-                hash_map::Entry::Vacant(v) => {
-                    if hdr.ty != quiche::Type::Initial {
-                        error!("Packet is not Initial");
-                        continue;
-                    }
+            let (_, conn) = if !h3connections.contains_key(&hdr.dcid) {
+                if hdr.ty != quiche::Type::Initial {
+                    error!("Packet is not Initial");
+                    continue;
+                }
 
-                    if hdr.version != quiche::VERSION_DRAFT17 {
-                        warn!("Doing version negotiation");
+                if hdr.version != quiche::VERSION_DRAFT17 {
+                    warn!("Doing version negotiation");
 
-                        let len = quiche::negotiate_version(&hdr.scid,
-                                                            &hdr.dcid,
-                                                            &mut out).unwrap();
-                        let out = &out[..len];
+                    let len = quiche::negotiate_version(&hdr.scid,
+                                                        &hdr.dcid,
+                                                        &mut out).unwrap();
+                    let out = &out[..len];
 
-                        socket.send_to(out, &src).unwrap();
-                        continue;
-                    }
+                    socket.send_to(out, &src).unwrap();
+                    continue;
+                }
 
-                    let mut scid: [u8; LOCAL_CONN_ID_LEN] = [0; LOCAL_CONN_ID_LEN];
-                    SystemRandom::new().fill(&mut scid[..]).unwrap();
+                let mut scid: [u8; LOCAL_CONN_ID_LEN] = [0; LOCAL_CONN_ID_LEN];
+                SystemRandom::new().fill(&mut scid[..]).unwrap();
 
-                    // Token is always present in Initial packets.
-                    let token = hdr.token.as_ref().unwrap();
+                // Token is always present in Initial packets.
+                let token = hdr.token.as_ref().unwrap();
 
-                    if token.is_empty() {
-                        warn!("Doing stateless retry");
+                if token.is_empty() {
+                    warn!("Doing stateless retry");
 
-                        let new_token = mint_token(&hdr, &src);
+                    let new_token = mint_token(&hdr, &src);
 
-                        let len = quiche::retry(&hdr.scid, &hdr.dcid, &scid,
-                                                &new_token, &mut out).unwrap();
-                        let out = &out[..len];
+                    let len = quiche::retry(&hdr.scid, &hdr.dcid, &scid,
+                                            &new_token, &mut out).unwrap();
+                    let out = &out[..len];
 
-                        socket.send_to(out, &src).unwrap();
-                        continue;
-                    }
+                    socket.send_to(out, &src).unwrap();
+                    continue;
+                }
 
-                    let odcid = validate_token(&src, token);
+                let odcid = validate_token(&src, token);
 
-                    if odcid == None {
-                        error!("Invalid address validation token");
-                        continue;
-                    }
+                if odcid == None {
+                    error!("Invalid address validation token");
+                    continue;
+                }
 
-                    debug!("New connection: dcid={} scid={} lcid={}",
-                           hex_dump(&hdr.dcid),
-                           hex_dump(&hdr.scid),
-                           hex_dump(&scid));
+                debug!("New connection: dcid={} scid={} lcid={}",
+                        hex_dump(&hdr.dcid),
+                        hex_dump(&hdr.scid),
+                        hex_dump(&scid));
 
-                    let conn = quiche::h3::accept(&scid, odcid, &mut config).unwrap();
+                let conn = quiche::h3::accept(&scid, odcid, &mut config).unwrap();
 
-                    v.insert(conn)
-                },
+                h3connections.insert(scid.to_vec(), (src, conn));
 
-                hash_map::Entry::Occupied(v) => v.into_mut(),
+                h3connections.get_mut(&scid[..]).unwrap()
+            } else {
+                h3connections.get_mut(&hdr.dcid).unwrap()
             };
 
             // Process potentially coalesced packets.
@@ -213,14 +216,15 @@ fn main() {
 
             debug!("{} processed {} bytes", conn.quic_conn.trace_id(), read);
 
+            // TODO exhange settings before reading requests
             let streams: Vec<u64> = conn.quic_conn.readable().collect();
             for s in streams {
                 info!("{} stream {} is readable", conn.quic_conn.trace_id(), s);
-                handle_stream(conn, s, args.get_str("--root"));
+                conn.handle_stream(s);
             }
         }
 
-        for (src, conn) in &mut h3connections {
+        for (peer, conn) in h3connections.values_mut() {
             loop {
                 let write = match conn.quic_conn.send(&mut out) {
                     Ok(v) => v,
@@ -238,63 +242,22 @@ fn main() {
                 };
 
                 // TODO: coalesce packets.
-                socket.send_to(&out[..write], &src).unwrap();
+                socket.send_to(&out[..write], &peer).unwrap();
 
                 debug!("{} written {} bytes", conn.quic_conn.trace_id(), write);
             }
         }
 
         // Garbage collect closed connections.
-        h3connections.retain(|_, ref mut c| {
+        h3connections.retain(|_, (_, ref mut c)| {
             debug!("Collecting garbage");
 
             if c.quic_conn.is_closed() {
-                debug!("{} connection collected", c.quic_conn.trace_id());
+                info!("{} connection collected {:?}", c.quic_conn.trace_id(), c.quic_conn.stats());
             }
 
             !c.quic_conn.is_closed()
         });
-    }
-}
-
-fn handle_stream(conn: &mut quiche::h3::H3Connection, stream: u64, root: &str) {
-    let stream_data = match conn.quic_conn.stream_recv(stream, std::usize::MAX) {
-        Ok(v) => v,
-
-        Err(quiche::Error::Done) => return,
-
-        Err(e) => panic!("{} stream recv failed {:?}",
-                         conn.quic_conn.trace_id(), e),
-    };
-
-    info!("{} stream {} has {} bytes (fin? {})", conn.quic_conn.trace_id(),
-          stream, stream_data.len(), stream_data.fin());
-
-    if stream_data.len() > 4 && &stream_data[..4] == b"GET " {
-        let uri = &stream_data[4..stream_data.len()];
-        let uri = String::from_utf8(uri.to_vec()).unwrap();
-        let uri = String::from(uri.lines().next().unwrap());
-        let uri = std::path::Path::new(&uri);
-        let mut path = std::path::PathBuf::from(root);
-
-        for c in uri.components() {
-            if let std::path::Component::Normal(v) = c {
-                path.push(v)
-            }
-        }
-
-        info!("{} got GET request for {:?} on stream {}",
-              conn.quic_conn.trace_id(), path, stream);
-
-        let data = std::fs::read(path.as_path())
-                    .unwrap_or_else(|_| Vec::from(String::from("Not Found!\r\n")));
-
-        info!("{} sending response of size {} on stream {}",
-              conn.quic_conn.trace_id(), data.len(), stream);
-
-        if let Err(e) = conn.quic_conn.stream_send(stream, &data, true) {
-            error!("{} stream send failed {:?}", conn.quic_conn.trace_id(), e);
-        }
     }
 }
 

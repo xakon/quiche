@@ -1,4 +1,4 @@
-// Copyright (C) 2018, Cloudflare, Inc.
+// Copyright (C) 2019, Cloudflare, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -29,21 +29,18 @@ extern crate log;
 
 use ring::rand::*;
 
-
-use quiche::h3::*;
-
 const LOCAL_CONN_ID_LEN: usize = 16;
 
 const MAX_DATAGRAM_SIZE: usize = 1452;
 
-const HTTP_REQ_STREAM_ID: u64 = 4;
-
-const USAGE: &str = "Usage: h3client [options] URL
+const USAGE: &str = "Usage:
+  h3client [options] URL
+  h3client -h | --help
 
 Options:
-  -h --help               Show this screen.
   --wire-version VERSION  The version number to send to the server [default: babababa].
   --no-verify             Don't verify server's certificate.
+  -h --help               Show this screen.
 ";
 
 fn main() {
@@ -78,6 +75,8 @@ fn main() {
     let mut config = quiche::h3::H3Config::new(version).unwrap();
 
     config.quiche_config.verify_peer(true);
+
+    config.quiche_config.set_application_protos(&[b"h3-17", b"hq-17", b"http/0.9"]).unwrap();
 
     config.quiche_config.set_idle_timeout(30);
     config.quiche_config.set_max_packet_size(MAX_DATAGRAM_SIZE as u64);
@@ -161,6 +160,8 @@ fn main() {
         }
 
         if h3conn.quic_conn.is_established() && !req_sent {
+            // TODO exchange settings before sending request
+
             info!("{} sending HTTP request for {}", h3conn.quic_conn.trace_id(), url.path());
 
             let req = if args.get_bool("--http1") {
@@ -170,32 +171,14 @@ fn main() {
                 format!("GET {}\r\n", url.path())
             };
 
-            // Old HTTP/ format
-            //h3conn.quic_conn.stream_send(HTTP_REQ_STREAM_ID, req.as_bytes(), true).unwrap();
-
-            /*let reqFrame = quiche::h3::frame::H3Frame::Headers{header_block:req.as_bytes().to_vec()};
-            let mut d: [u8; 128] = [42; 128];
-            let mut b = quiche::octets::Octets::with_slice(&mut d);
-            reqFrame.to_bytes(&mut b).unwrap();
-
-
-            h3conn.quic_conn.stream_send(HTTP_REQ_STREAM_ID, &b.to_vec(), true).unwrap();*/
             h3conn.send_request(req);
             req_sent = true;
         }
 
         let streams: Vec<u64> = h3conn.quic_conn.readable().collect();
         for s in streams {
-            let data = h3conn.quic_conn.stream_recv(s, std::usize::MAX).unwrap();
-
-            info!("{} stream {} has {} bytes (fin? {})",
-                  h3conn.quic_conn.trace_id(), s, data.len(), data.fin());
-
-            print!("{}", unsafe { std::str::from_utf8_unchecked(&data) });
-
-            if s == HTTP_REQ_STREAM_ID && data.fin() {
-                h3conn.quic_conn.close(true, 0x00, b"kthxbye").unwrap();
-            }
+            info!("{} stream {} is readable", h3conn.quic_conn.trace_id(), s);
+            h3conn.handle_stream(s);
         }
 
         loop {
@@ -221,7 +204,7 @@ fn main() {
         }
 
         if h3conn.quic_conn.is_closed() {
-            debug!("{} connection closed", h3conn.quic_conn.trace_id());
+            info!("{} connection closed, {:?}", h3conn.quic_conn.trace_id(), h3conn.quic_conn.stats());
             break;
         }
     }
