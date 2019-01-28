@@ -30,10 +30,20 @@ pub mod frame;
 
 use crate::octets;
 use super::Result;
+use super::stream;
+
+const H3_CONTROL_STREAM_TYPE_ID:    u8 = 0x43;
+const H3_PUSH_STREAM_TYPE_ID:       u8 = 0x50;
+const QPACK_ENCODER_STREAM_TYPE_ID: u8 = 0x48;
+const QPACK_DECODER_STREAM_TYPE_ID: u8 = 0x68;
 
 pub struct H3Config {
     pub quiche_config: super::Config,
     pub root_dir: String,
+    pub num_placeholders: u16,
+    pub max_header_list_size: u16,
+    pub qpack_max_table_capacity: u16,
+    pub qpack_blocked_streams: u16,
 }
 
 impl H3Config {
@@ -45,12 +55,33 @@ impl H3Config {
         Ok(H3Config {
             quiche_config: super::Config::new(version).unwrap(),
             root_dir: String::new(),
+            num_placeholders: 16,
+            max_header_list_size: 0,
+            qpack_max_table_capacity: 0,
+            qpack_blocked_streams: 0
         })
     }
 
     pub fn set_root_dir(&mut self, root_dir: &String) {
         self.root_dir = String::clone(root_dir);
     }
+
+    pub fn set_num_placeholders(&mut self, num_placeholders: u16) {
+        self.num_placeholders = num_placeholders;
+    }
+
+    pub fn set_max_header_list_size(&mut self, max_header_list_size: u16) {
+        self.max_header_list_size = max_header_list_size;
+    }
+
+    pub fn set_qpack_max_table_capacity(&mut self, qpack_max_table_capacity: u16) {
+        self.qpack_max_table_capacity = qpack_max_table_capacity;
+    }
+
+    pub fn set_qpacked_blocked_streams(&mut self, qpack_blocked_streams: u16) {
+        self.qpack_blocked_streams = qpack_blocked_streams;
+    }
+
 }
 
 /// An HTTP/3 connection.
@@ -58,6 +89,13 @@ pub struct H3Connection {
     pub quic_conn: Box<super::Connection>,
 
     root_dir: String,
+    num_placeholders: u16,
+    max_header_list_size: u16,
+    qpack_max_table_capacity: u16,
+    qpack_blocked_streams: u16,
+
+    control_stream_open: bool,
+    qpack_control_streams_open: bool,
 }
 
 impl H3Connection {
@@ -70,7 +108,95 @@ impl H3Connection {
             Ok(Box::new(H3Connection {
                 quic_conn: super::Connection::new(scid, odcid, &mut config.quiche_config, is_server)?,
                 root_dir: root,
+                num_placeholders: config.num_placeholders,
+                max_header_list_size: config.max_header_list_size,
+                qpack_max_table_capacity: config.qpack_max_table_capacity,
+                qpack_blocked_streams: config.qpack_blocked_streams,
+                control_stream_open: false,
+                qpack_control_streams_open: false,
             }))
+    }
+
+    fn get_control_stream_id(&mut self) -> u64 {
+        // TODO get an available unidirectional stream ID more nicely
+        if self.quic_conn.is_server {
+            return 0x3;
+        } else {
+            return 0x2;
+        }
+    }
+
+    fn get_encoder_stream_id(&mut self) -> u64 {
+        // TODO get an available unidirectional stream ID more nicely
+        if self.quic_conn.is_server {
+            return 0x7;
+        } else {
+            return 0x6;
+        }
+    }
+
+    fn get_decoder_stream_id(&mut self) -> u64 {
+        // TODO get an available unidirectional stream ID more nicely
+        if self.quic_conn.is_server {
+            return 0x11;
+        } else {
+            return 0x10;
+        }
+    }
+
+    pub fn open_control_stream(&mut self) {
+        if !self.control_stream_open {
+            let mut d: [u8; 128] = [42; 128];
+            let mut b = octets::Octets::with_slice(&mut d);
+            b.put_u8(H3_CONTROL_STREAM_TYPE_ID);
+            let off = b.off();
+            let stream_id = self.get_control_stream_id();
+            self.quic_conn.stream_send(stream_id, &mut d[..off], false).unwrap();
+
+            self.control_stream_open = true;
+        }
+    }
+
+    pub fn open_qpack_streams(&mut self) {
+        if !self.qpack_control_streams_open {
+            let mut e: [u8; 128] = [42; 128];
+            let mut enc_b = octets::Octets::with_slice(&mut e);
+            enc_b.put_u8(QPACK_ENCODER_STREAM_TYPE_ID);
+            let off = enc_b.off();
+            let stream_id = self.get_encoder_stream_id();
+            self.quic_conn.stream_send(stream_id, &mut e[..off], false).unwrap();
+
+            let mut d: [u8; 128] = [42; 128];
+            let mut dec_b = octets::Octets::with_slice(&mut d);
+            dec_b.put_u8(QPACK_DECODER_STREAM_TYPE_ID);
+            let off = dec_b.off();
+            let stream_id = self.get_decoder_stream_id();
+            self.quic_conn.stream_send(stream_id, &mut d[..off], false).unwrap();
+
+            self.qpack_control_streams_open = true;
+        }
+    }
+
+    // Send SETTINGS frame based on H3 config
+    pub fn send_settings(&mut self) {
+        self.open_control_stream();
+
+        let mut d: [u8; 128] = [42; 128];
+
+        let frame = frame::H3Frame::Settings {
+            num_placeholders: Some(16),
+            max_header_list_size: Some(1024),
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None
+        };
+
+        let mut b = octets::Octets::with_slice(&mut d);
+
+        frame.to_bytes(&mut b).unwrap();
+        let off = b.off();
+        let stream_id = self.get_control_stream_id();
+
+        self.quic_conn.stream_send(stream_id, &mut d[..off], false).unwrap();
     }
 
     // Send a no-body request
@@ -130,53 +256,79 @@ impl H3Connection {
         info!("{} stream {} has {} bytes (fin? {})", self.quic_conn.trace_id(),
             stream, stream_data.len(), stream_data.fin());
 
-        // TODO stream frame parsing
-        if stream_data.len() > 1 {
-            let mut o = octets::Octets::with_slice(&mut stream_data);
-            let frame = frame::H3Frame::from_bytes(&mut o).unwrap();
-            debug!("received {:?}", frame);
+        // H3 unidirectional streams have types as first byte
+        if !stream::is_bidi(stream) {
 
-            match frame {
-                frame::H3Frame::Headers { header_block} => {
-                    //debug!("received {:?}", frame);
-                    //dbg!(&header_block);
+            if stream_data.off() == 0 {
+                //dbg!(&stream_data);
+                let mut o = octets::Octets::with_slice(&mut stream_data);
+                let stream_type = o.get_u8().unwrap();
+                match stream_type {
+                    H3_CONTROL_STREAM_TYPE_ID => {
+                        info!("{} stream {} is a control stream", self.quic_conn.trace_id(), stream);
+                    },
+                    H3_PUSH_STREAM_TYPE_ID => {
+                        info!("{} stream {} is a push stream", self.quic_conn.trace_id(), stream);
+                    },
+                    QPACK_ENCODER_STREAM_TYPE_ID => {
+                        info!("{} stream {} is a QPACK encoder stream", self.quic_conn.trace_id(), stream);
+                    },
+                    QPACK_DECODER_STREAM_TYPE_ID => {
+                        info!("{} stream {} is a QPACK decoder stream", self.quic_conn.trace_id(), stream);
+                    },
+                    _ => {
+                        info!("{} stream {} is an unknown stream type (val={})!", self.quic_conn.trace_id(), stream, stream_type);
+                    },
+                }
+            }
+        } else {
+            // TODO stream frame parsing
+            if stream_data.len() > 1 {
+                let mut o = octets::Octets::with_slice(&mut stream_data);
+                let frame = frame::H3Frame::from_bytes(&mut o).unwrap();
+                debug!("received {:?}", frame);
 
-                    // TODO properly parse HEADERS
-                    if &header_block[..4] == b"GET " {
-                        let uri = &header_block[4..header_block.len()];
-                        let uri = String::from_utf8(uri.to_vec()).unwrap();
-                        let uri = String::from(uri.lines().next().unwrap());
-                        let uri = std::path::Path::new(&uri);
-                        let mut path = std::path::PathBuf::from(String::clone(&self.root_dir));
+                match frame {
+                    frame::H3Frame::Headers { header_block} => {
+                        //debug!("received {:?}", frame);
+                        //dbg!(&header_block);
 
-                        for c in uri.components() {
-                            if let std::path::Component::Normal(v) = c {
-                                path.push(v)
+                        // TODO properly parse HEADERS
+                        if &header_block[..4] == b"GET " {
+                            let uri = &header_block[4..header_block.len()];
+                            let uri = String::from_utf8(uri.to_vec()).unwrap();
+                            let uri = String::from(uri.lines().next().unwrap());
+                            let uri = std::path::Path::new(&uri);
+                            let mut path = std::path::PathBuf::from(String::clone(&self.root_dir));
+
+                            for c in uri.components() {
+                                if let std::path::Component::Normal(v) = c {
+                                    path.push(v)
+                                }
+                            }
+
+                            info!("{} got GET request for {:?} on stream {}",
+                                self.quic_conn.trace_id(), path, stream);
+
+                            // TODO *actually* response with something other than 404
+                            self.send_response(stream, String::from("404 Not Found"), String::from(""));
+
+                        } else if &header_block[..4] == b"404 " {
+                            info!("{} got 404 response on stream {}",
+                                self.quic_conn.trace_id(), stream);
+
+                            if stream_data.fin() {
+                                info!("{} response received, closing..,", self.quic_conn.trace_id());
+                                self.quic_conn.close(true, 0x00, b"kthxbye").unwrap();
                             }
                         }
+                    },
 
-                        info!("{} got GET request for {:?} on stream {}",
-                            self.quic_conn.trace_id(), path, stream);
-
-                        // TODO *actually* response with something other than 404
-                        self.send_response(stream, String::from("404 Not Found"), String::from(""));
-
-                    } else if &header_block[..4] == b"404 " {
-                        info!("{} got 404 response on stream {}",
-                            self.quic_conn.trace_id(), stream);
-
-                        if stream_data.fin() {
-                            info!("{} response received, closing..,", self.quic_conn.trace_id());
-                            self.quic_conn.close(true, 0x00, b"kthxbye").unwrap();
-                        }
-                    }
-                },
-
-                _ => {
-                    debug!("Not implemented!");
-                },
-            };
-
+                    _ => {
+                        debug!("Not implemented!");
+                    },
+                };
+            }
         }
 
     }

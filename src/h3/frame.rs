@@ -28,17 +28,8 @@ use crate::Result;
 use crate::Error;
 
 use crate::octets;
-use crate::ranges;
-use crate::stream;
 
 use std::mem;
-
-// H3 Settings Parameters
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SettingsParameter {
-    id: u16,
-    value: u64
-}
 
 //const PRIORITIZED_ELEM_TYPE_MASK: u8 = 0x30;
 const ELEM_DEPENDENCY_TYPE_MASK: u8 = 0x30;
@@ -147,7 +138,10 @@ pub enum H3Frame {
     },
 
     Settings {
-        parameters: Vec<SettingsParameter>
+        num_placeholders: std::option::Option<u64>,
+        max_header_list_size: std::option::Option<u64>,
+        qpack_max_table_capacity: std::option::Option<u64>,
+        qpack_blocked_streams: std::option::Option<u64>
     },
 
     PushPromise {
@@ -278,19 +272,75 @@ impl H3Frame {
                 b.put_varint(*push_id)?;
             },
 
-            H3Frame::Settings { parameters } => {
+            H3Frame::Settings { num_placeholders, max_header_list_size, qpack_max_table_capacity, qpack_blocked_streams } => {
                 // TODO make prettier
                 let mut len = 0;
-                for param in parameters {
-                    len += mem::size_of::<u16>() + octets::varint_len(param.value);
+
+                match num_placeholders {
+                    Some(val) => {
+                        len += mem::size_of::<u16>();
+                        len += octets::varint_len(*val);
+                    },
+                    None => {}
+                }
+
+                match max_header_list_size {
+                    Some(val) => {
+                        len += mem::size_of::<u16>();
+                        len += octets::varint_len(*val);
+                    },
+                    None => {}
+                }
+
+                match qpack_max_table_capacity {
+                    Some(val) => {
+                        len += mem::size_of::<u16>();
+                        len += octets::varint_len(*val);
+                    },
+                    None => {}
+                }
+
+                match qpack_blocked_streams {
+                    Some(val) => {
+                        len += mem::size_of::<u16>();
+                        len += octets::varint_len(*val);
+                    },
+                    None => {}
                 }
 
                 b.put_varint(len as u64)?;
                 b.put_varint(0x4)?;
 
-                for param in parameters {
-                    b.put_u16(param.id)?;
-                    b.put_varint(param.value)?;
+                match num_placeholders {
+                    Some(val) => {
+                        b.put_u16(0x8)?;
+                        b.put_varint(*val as u64)?;
+                    },
+                    None => {}
+                }
+
+                match max_header_list_size {
+                    Some(val) => {
+                        b.put_u16(0x6)?;
+                        b.put_varint(*val as u64)?;
+                    },
+                    None => {}
+                }
+
+                match qpack_max_table_capacity {
+                    Some(val) => {
+                        b.put_u16(0x1)?;
+                        b.put_varint(*val as u64)?;
+                    },
+                    None => {}
+                }
+
+                match qpack_blocked_streams {
+                    Some(val) => {
+                        b.put_u16(0x7)?;
+                        b.put_varint(*val as u64)?;
+                    },
+                    None => {}
                 }
             },
 
@@ -345,11 +395,11 @@ impl std::fmt::Debug for H3Frame {
             },
 
             H3Frame::CancelPush { push_id } => {
-                write!(f, "CANCEL_PUSH push push id={}", push_id)?;
+                write!(f, "CANCEL_PUSH push id={}", push_id)?;
             },
 
-            H3Frame::Settings { parameters } => {
-                write!(f, "SETTINGS num params={}", parameters.len())?;
+            H3Frame::Settings { num_placeholders, max_header_list_size, qpack_max_table_capacity, qpack_blocked_streams } => {
+                write!(f, "SETTINGS num placeholders={}, max header list size={}, qpack max table capacity={}, qpack blocked streams={} ", num_placeholders.unwrap_or(999), max_header_list_size.unwrap_or(999), qpack_max_table_capacity.unwrap_or(999), qpack_blocked_streams.unwrap_or(999) )?;
             },
 
             H3Frame::PushPromise { push_id, header_block } => {
@@ -374,13 +424,34 @@ impl std::fmt::Debug for H3Frame {
 }
 
 fn parse_settings_frame(payload_length: u64, b: &mut octets::Octets) -> Result<H3Frame> {
-    let mut parameters = Vec::new();
+    let mut num_placeholders = None;
+    let mut max_header_list_size = None;
+    let mut qpack_max_table_capacity = None;
+    let mut qpack_blocked_streams = None;
 
     while b.off() < payload_length as usize { // TODO test this exit condition
-        parameters.push(SettingsParameter{ id: b.get_u16()?, value: b.get_varint()? } );
+        let setting = b.get_u16()?;
+
+        match setting {
+            0x1 => {
+                qpack_max_table_capacity = Some(b.get_varint()?);
+            },
+            0x6 => {
+                max_header_list_size = Some(b.get_varint()?);
+            },
+            0x7 => {
+                qpack_blocked_streams = Some(b.get_varint()?);
+            },
+            0x8 => {
+                num_placeholders = Some(b.get_varint()?);
+            },
+            _ => {
+                // TODO: not implemented
+            }
+        }
     }
 
-    Ok(H3Frame::Settings { parameters })
+    Ok(H3Frame::Settings { num_placeholders, max_header_list_size, qpack_max_table_capacity, qpack_blocked_streams })
 }
 
 fn parse_priority_frame(b: &mut octets::Octets) -> Result<H3Frame> {
@@ -516,10 +587,75 @@ mod tests {
     }
 
     #[test]
-    fn settings() {
-        // TODO let mut d: [u8; 128] = [42; 128];
+    fn settings_all() {
+        let mut d: [u8; 128] = [42; 128];
 
-        assert_eq!(true, true);
+        let frame = H3Frame::Settings {
+            num_placeholders: Some(16),
+            max_header_list_size: Some(1024),
+            qpack_max_table_capacity: Some(0),
+            qpack_blocked_streams: Some(0)
+        };
+
+        let wire_len = {
+            let mut b = octets::Octets::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 15);
+
+        {
+            let mut b = octets::Octets::with_slice(&mut d);
+            assert_eq!(H3Frame::from_bytes(&mut b).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn settings_h3_only() {
+        let mut d: [u8; 128] = [42; 128];
+
+        let frame = H3Frame::Settings {
+            num_placeholders: Some(16),
+            max_header_list_size: Some(1024),
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None
+        };
+
+        let wire_len = {
+            let mut b = octets::Octets::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 9);
+
+        {
+            let mut b = octets::Octets::with_slice(&mut d);
+            assert_eq!(H3Frame::from_bytes(&mut b).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn settings_qpack_only() {
+        let mut d: [u8; 128] = [42; 128];
+
+        let frame = H3Frame::Settings {
+            num_placeholders: None,
+            max_header_list_size: None,
+            qpack_max_table_capacity: Some(0),
+            qpack_blocked_streams: Some(0)
+        };
+
+        let wire_len = {
+            let mut b = octets::Octets::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 8);
+
+        {
+            let mut b = octets::Octets::with_slice(&mut d);
+            assert_eq!(H3Frame::from_bytes(&mut b).unwrap(), frame);
+        }
     }
 
     #[test]

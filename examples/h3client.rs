@@ -84,6 +84,7 @@ fn main() {
     config.quiche_config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.quiche_config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.quiche_config.set_initial_max_streams_bidi(100);
+    config.quiche_config.set_initial_max_streams_uni(100);
     config.quiche_config.set_disable_migration(true);
 
     if args.get_bool("--no-verify") {
@@ -160,7 +161,9 @@ fn main() {
         }
 
         if h3conn.quic_conn.is_established() && !req_sent {
-            // TODO exchange settings before sending request
+            // TODO make opening control streams saner
+            h3conn.send_settings();
+            h3conn.open_qpack_streams();
 
             info!("{} sending HTTP request for {}", h3conn.quic_conn.trace_id(), url.path());
 
@@ -171,7 +174,7 @@ fn main() {
                 format!("GET {}\r\n", url.path())
             };
 
-            h3conn.send_request(req);
+            //h3conn.send_request(req);
             req_sent = true;
         }
 

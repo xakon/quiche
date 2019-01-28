@@ -87,7 +87,7 @@ fn main() {
     config.quiche_config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.quiche_config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.quiche_config.set_initial_max_streams_bidi(100);
-    config.quiche_config.set_initial_max_streams_uni(5);
+    config.quiche_config.set_initial_max_streams_uni(100);
     config.quiche_config.set_disable_migration(true);
 
     config.set_root_dir(&String::from(args.get_str("--root")));
@@ -216,7 +216,13 @@ fn main() {
 
             debug!("{} processed {} bytes", conn.quic_conn.trace_id(), read);
 
-            // TODO exhange settings before reading requests
+            if conn.quic_conn.is_established() {
+                // TODO make opening control streams saner
+                conn.send_settings();
+                conn.open_qpack_streams();
+            }
+
+
             let streams: Vec<u64> = conn.quic_conn.readable().collect();
             for s in streams {
                 info!("{} stream {} is readable", conn.quic_conn.trace_id(), s);
