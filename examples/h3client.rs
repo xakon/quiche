@@ -162,8 +162,10 @@ fn main() {
 
         if h3conn.quic_conn.is_established() && !req_sent {
             // TODO make opening control streams saner
-            h3conn.send_settings();
-            h3conn.open_qpack_streams();
+            if !h3conn.is_established() {
+                h3conn.send_settings();
+                h3conn.open_qpack_streams();
+            }
 
             info!("{} sending HTTP request for {}", h3conn.quic_conn.trace_id(), url.path());
 
@@ -181,7 +183,10 @@ fn main() {
         let streams: Vec<u64> = h3conn.quic_conn.readable().collect();
         for s in streams {
             info!("{} stream {} is readable", h3conn.quic_conn.trace_id(), s);
-            h3conn.handle_stream(s);
+            if h3conn.handle_stream(s).is_err() {
+                break;
+            }
+
         }
 
         loop {

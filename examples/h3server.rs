@@ -218,15 +218,19 @@ fn main() {
 
             if conn.quic_conn.is_established() {
                 // TODO make opening control streams saner
-                conn.send_settings();
-                conn.open_qpack_streams();
+                if !conn.is_established() {
+                    conn.send_settings();
+                    conn.open_qpack_streams();
+                }
             }
 
 
             let streams: Vec<u64> = conn.quic_conn.readable().collect();
             for s in streams {
                 info!("{} stream {} is readable", conn.quic_conn.trace_id(), s);
-                conn.handle_stream(s);
+                if conn.handle_stream(s).is_err() {
+                    break;
+                }
             }
         }
 

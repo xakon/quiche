@@ -168,7 +168,7 @@ impl H3Frame {
         let payload_length = b.get_varint()?;
         let frame_type = b.get_u8()?;
 
-        //debug!("GOT FRAME {:x}, payload_len= {:x}", frame_type, payload_length);
+        //debug!("GOT FRAME {:x}, payload_len= {}", frame_type, payload_length);
 
         // TODO handling of 0-length frames
         let frame = match frame_type {
